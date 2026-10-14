@@ -126,6 +126,7 @@ public final class Authentication {
         context.dsid = dsid
         
         let authType = statusDictionary["au"] as? String
+        let hsc = statusDictionary["hsc"] as? Int
         switch authType {
         case "trustedDeviceSecondaryAuth":
             guard let verificationHandler = verificationHandler else {
@@ -156,6 +157,30 @@ public final class Authentication {
                 idmsToken: idmsToken,
                 anisetteData: anisetteData,
                 verificationHandler: verificationHandler
+            )
+            
+            return try await authenticate(
+                appleID: unsanitizedAppleID,
+                password: password,
+                anisetteData: anisetteData,
+                verificationHandler: verificationHandler
+            )
+            
+        case nil where hsc == 409:
+            // Android client (e.g. <Pixel 7> ... com.apple.akd): Apple answers the
+            // password proof with hsc 409 and no `au`, and has already pushed a code
+            // to the trusted devices. Validate that code instead of requesting a new
+            // one; treating this as a finished sign-in makes apptokens fail (-22411).
+            guard let verificationHandler = verificationHandler else {
+                throw AppleAPIError.requiresTwoFactorAuthentication
+            }
+            
+            try await requestTrustedDeviceTwoFactorCode(
+                dsid: dsid,
+                idmsToken: idmsToken,
+                anisetteData: anisetteData,
+                verificationHandler: verificationHandler,
+                sendCode: false
             )
             
             return try await authenticate(
@@ -246,7 +271,7 @@ public final class Authentication {
             "Content-Type": "text/x-xml-plist",
             "X-MMe-Client-Info": anisetteData.deviceDescription,
             "Accept": "*/*",
-            "User-Agent": "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)",
+            "User-Agent": "akd/1.0 CFNetwork/808.1.4",
             "Connection": "close"
         ]
         
@@ -373,19 +398,23 @@ public final class Authentication {
         dsid: String,
         idmsToken: String,
         anisetteData: AnisetteData,
-        verificationHandler: @escaping (@escaping (String?) -> Void) async -> Void
+        verificationHandler: @escaping (@escaping (String?) -> Void) async -> Void,
+        sendCode: Bool = true
     ) async throws {
         let requestURL = URL(string: "https://gsa.apple.com/auth/verify/trusteddevice")!
         let verifyURL = URL(string: "https://gsa.apple.com/grandslam/GsService2/validate")!
         
-        let request = makeTwoFactorCodeRequest(
-            url: requestURL,
-            dsid: dsid,
-            idmsToken: idmsToken,
-            anisetteData: anisetteData
-        )
-        
-        let (_, _) = try await AppleAPI.shared.session.data(for: request)
+        // Skipped when Apple already pushed a code during sign-in (hsc 409, no `au`).
+        if sendCode {
+            let request = makeTwoFactorCodeRequest(
+                url: requestURL,
+                dsid: dsid,
+                idmsToken: idmsToken,
+                anisetteData: anisetteData
+            )
+            
+            let (_, _) = try await AppleAPI.shared.session.data(for: request)
+        }
         
         let verificationCode = try await withCheckedThrowingContinuation { continuation in
             Task {
